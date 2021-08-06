@@ -5,6 +5,8 @@ using Microsoft.Extensions.DependencyInjection;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using static FluentValidation.AssemblyScanner;
 
 namespace Blazored.FluentValidation
@@ -33,6 +35,39 @@ namespace Blazored.FluentValidation
 
             return editContext;
         }
+        
+        private static void AddPendingValidation(this EditContext context, Guid operationId)
+        {
+            if (!context.Properties.TryGetValue("PendingValidations", out _))
+            {
+                context.Properties["PendingValidations"] = new List<Guid>();
+            }
+
+            ((List<Guid>)context.Properties["PendingValidations"]).Add(operationId);
+        }
+
+        private static void RemovePendingValidation(this EditContext context, Guid operationId)
+        {
+            if (!context.Properties.TryGetValue("PendingValidations", out _))
+            {
+                return;
+            }
+
+            ((List<Guid>)context.Properties["PendingValidations"]).Remove(operationId);
+        }
+
+        public static async Task WaitForAsyncValidation(this EditContext context, CancellationToken token = default)
+        {
+            if (!context.Properties.TryGetValue("PendingValidations", out _))
+            {
+                return;
+            }
+
+            if (((List<Guid>)context.Properties["PendingValidations"]).Any())
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1), token);
+            }
+        }
 
         private static async void ValidateModel(EditContext editContext,
                                                 ValidationMessageStore messages,
@@ -45,18 +80,28 @@ namespace Blazored.FluentValidation
 
             if (validator is object)
             {
-                var context = ValidationContext<object>.CreateWithOptions(editContext.Model, fluentValidationValidator.Options ?? (opt => opt.IncludeAllRuleSets()));
-
-                var validationResults = await validator.ValidateAsync(context);
-
-                messages.Clear();
-                foreach (var validationResult in validationResults.Errors)
+                var operationId = Guid.NewGuid();
+            
+                editContext.AddPendingValidation(operationId);
+                try
                 {
-                    var fieldIdentifier = ToFieldIdentifier(editContext, validationResult.PropertyName);
-                    messages.Add(fieldIdentifier, validationResult.ErrorMessage);
-                }
+                    var context = ValidationContext<object>.CreateWithOptions(editContext.Model, fluentValidationValidator.Options ?? (opt => opt.IncludeAllRuleSets()));
 
-                editContext.NotifyValidationStateChanged();
+                    var validationResults = await validator.ValidateAsync(context);
+
+                    messages.Clear();
+                    foreach (var validationResult in validationResults.Errors)
+                    {
+                        var fieldIdentifier = ToFieldIdentifier(editContext, validationResult.PropertyName);
+                        messages.Add(fieldIdentifier, validationResult.ErrorMessage);
+                    }
+
+                    editContext.NotifyValidationStateChanged();
+                }
+                finally
+                {
+                    editContext.RemovePendingValidation(operationId);
+                }
             }
         }
 
@@ -74,12 +119,22 @@ namespace Blazored.FluentValidation
 
             if (validator is object)
             {
-                var validationResults = await validator.ValidateAsync(context);
+                var operationId = Guid.NewGuid();
+            
+                editContext.AddPendingValidation(operationId);
+                try
+                {
+                    var validationResults = await validator.ValidateAsync(context);
 
-                messages.Clear(fieldIdentifier);
-                messages.Add(fieldIdentifier, validationResults.Errors.Select(error => error.ErrorMessage));
+                    messages.Clear(fieldIdentifier);
+                    messages.Add(fieldIdentifier, validationResults.Errors.Select(error => error.ErrorMessage));
 
-                editContext.NotifyValidationStateChanged();
+                    editContext.NotifyValidationStateChanged();
+                }
+                finally
+                {
+                    editContext.RemovePendingValidation(operationId);
+                }
             }
         }
 
